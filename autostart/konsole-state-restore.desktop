@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Restore Konsole windows
+Comment=Reopen Konsole windows and tabs and put windows back on their desktops and monitors
+Exec=@BIN@ restore --if-none
+Icon=utilities-terminal
+Terminal=false
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2

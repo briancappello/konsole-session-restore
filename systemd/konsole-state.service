@@ -1,0 +1,13 @@
+[Unit]
+Description=Snapshot Konsole windows, tabs and window placement
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ save --quiet
+Nice=10
+IOSchedulingClass=idle
+# Runs every minute: keep routine start/finish chatter out of the journal.
+# The script's own output (skip reasons, archive notices, errors) is raised to
+# notice so it is still logged.
+LogLevelMax=notice
+SyslogLevel=notice

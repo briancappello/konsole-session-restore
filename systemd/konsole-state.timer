@@ -1,0 +1,13 @@
+[Unit]
+Description=Snapshot Konsole state every minute
+# Runs only inside the graphical session and stops with it at logout.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Timer]
+OnActiveSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=graphical-session.target
