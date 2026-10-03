@@ -1,0 +1,1133 @@
+#!/usr/bin/env python3
+"""Save and restore Konsole windows/tabs and window placement on KDE Plasma 6.
+
+  konsole-state save [FILE] [--quiet]  # default: ~/.local/state/konsole-state/session.json
+  konsole-state restore [FILE] [--run] [--if-none] [--no-check] [--evidence]
+      --run       re-execute saved foreground commands (opencode tabs always reopen)
+      --if-none   do nothing if a Konsole window is already open (used at login)
+      --no-check  skip the self-check (45 s later: snapshot <stem>.post-restore.json
+                  and verify it against what was restored)
+      --evidence  save screenshots of the top panel strip of each monitor before
+                  and after placement clean-up (debugging; needs spectacle,
+                  ImageMagick and kscreen-doctor)
+  konsole-state verify EXPECTED.json ACTUAL.json
+  konsole-state doctor   # check that this system supports everything used here
+  konsole-state place [FILE] [--dry-run]
+      move other apps' windows (Firefox, IDEs, ...) back to the virtual desktop,
+      monitor/position and maximized state recorded in FILE, matched by app +
+      title; uncertain matches are left alone. Positions that are not on a
+      current monitor are skipped (desktop still restored). Restore does this
+      automatically (and places restored Konsole windows exactly).
+
+The first save after a reboot archives the previous boot's final snapshot as
+session.last-boot.json (+ .last-boot.screens/) before replacing it.
+
+A save is skipped (previous snapshot kept) while Plasma is shutting down, when
+no Konsole window is open, or while another save/restore holds the lock.
+Automation: konsole-state.timer (systemd --user, every 60 s) saves;
+~/.config/autostart/konsole-state-restore.desktop restores at login.
+
+Saved per tab: profile, working directory, foreground command, visible screen text.
+Limits: scrollback beyond the visible screen is not exposed over D-Bus; running
+processes cannot survive a reboot, so commands are shown (or re-run with --run).
+Split panes are flattened into tabs.
+
+Optional opencode support: opencode tabs are always relaunched as
+`opencode -s <session>`, using the session the TUI is currently showing. That
+comes from the TUI plugin konsole-session-tracker.ts (installed into
+~/.config/opencode/tui-plugins by install.sh). If the plugin has no record, the
+script falls back to `-s` on the command line, then to the most recently updated
+session in that directory (reported as a guess). Without opencode, this is inert.
+"""
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+def find_qdbus():
+    """The Qt 6 qdbus binary: its name and location differ between distributions."""
+    for cand in ("qdbus6", "qdbus-qt6", "/usr/lib/qt6/bin/qdbus", "/usr/lib64/qt6/bin/qdbus",
+                 "/usr/lib/x86_64-linux-gnu/qt6/bin/qdbus", "/usr/lib/aarch64-linux-gnu/qt6/bin/qdbus",
+                 "qdbus"):
+        path = shutil.which(cand) if "/" not in cand else (cand if os.access(cand, os.X_OK) else None)
+        if path:
+            return path
+    return "qdbus6"  # doctor reports it missing
+
+
+QDBUS = find_qdbus()
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+STATE_DIR = XDG_STATE / "konsole-state"
+DEFAULT_FILE = STATE_DIR / "session.json"
+OC_TRACKER_DIR = XDG_STATE / "opencode-tui-sessions"
+PROFILE_ENV = "KONSOLE_STATE_PROFILE"
+OC_DB = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "opencode/opencode.db"
+
+
+def q(service, path=None, method=None, *args):
+    cmd = [QDBUS, service] + [a for a in (path, method) if a] + list(map(str, args))
+    r = subprocess.run(cmd,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"{service} {path} {method}: {r.stderr.strip()}")
+    return r.stdout.rstrip("\n")
+
+
+def services():
+    out = subprocess.run([QDBUS], capture_output=True, text=True).stdout.split()
+    found = [s for s in out if s == "org.kde.konsole" or s.startswith("org.kde.konsole-")]
+    # PID order = launch order, so window order is stable across snapshots.
+    return sorted(found, key=lambda s: int(s.rsplit("-", 1)[1]) if s.rsplit("-", 1)[1].isdigit() else 0)
+
+
+def object_paths(service, prefix):
+    return [p for p in q(service).splitlines()
+            if p.startswith(prefix + "/") and p.count("/") == 2]
+
+
+def proc_argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return [a.decode(errors="replace") for a in raw.split(b"\0") if a] or None
+
+
+def proc_env(pid):
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    return dict(e.decode(errors="replace").split("=", 1) for e in raw.split(b"\0") if b"=" in e)
+
+
+def tty_foreground(pid):
+    """Leader of the terminal's foreground process group (tpgid in /proc/<pid>/stat).
+
+    Konsole's D-Bus foregroundProcessId can lag behind, e.g. it keeps reporting
+    the restore launcher's /bin/sh while opencode is in the foreground.
+    """
+    try:
+        tpgid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[5])
+    except (OSError, IndexError, ValueError):
+        return None
+    return tpgid if tpgid > 0 and Path(f"/proc/{tpgid}").exists() else None
+
+
+def proc_start_epoch(pid):
+    """Process start time as a Unix timestamp (to reject tracker files from a reused PID)."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        btime = next(int(l.split()[1]) for l in Path("/proc/stat").read_text().splitlines()
+                     if l.startswith("btime "))
+        return btime + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, StopIteration, IndexError, ValueError):
+        return None
+
+
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish"}
+
+
+def is_shell(argv):
+    """True for an interactive shell. A tab started with `konsole -e cmd` runs cmd directly."""
+    if not argv:
+        return True
+    name = Path(argv[0].lstrip("-")).name
+    return name in SHELLS or name == Path(os.environ.get("SHELL", "")).name
+
+
+def is_opencode(argv):
+    return bool(argv) and Path(argv[0]).name == "opencode"
+
+
+def argv_session(argv):
+    for i, a in enumerate(argv[1:], 1):
+        if a in ("-s", "--session") and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--session="):
+            return a.split("=", 1)[1]
+        if a.startswith("-s") and len(a) > 2:
+            return a[2:]
+    return None
+
+
+def tracker_live(f):
+    """A tracker file belongs to a running opencode process (not a reused PID)."""
+    try:
+        pid = int(f.stem)
+        started = proc_start_epoch(pid)
+        return started is not None and f.stat().st_mtime >= started - 1
+    except (OSError, ValueError):
+        return False
+
+
+def prune_trackers():
+    """Drop tracker files left by processes that are gone (a reboot skips the
+    plugin's own clean-up), so the directory does not grow with every boot."""
+    if OC_TRACKER_DIR.exists():
+        for f in OC_TRACKER_DIR.glob("*.json"):
+            if not tracker_live(f):
+                f.unlink(missing_ok=True)
+
+
+def tracked_session(pid):
+    """Session reported by the TUI plugin: (found, session_id_or_None_for_home)."""
+    f = OC_TRACKER_DIR / f"{pid}.json"
+    try:
+        started = proc_start_epoch(pid)
+        if started is not None and f.stat().st_mtime < started - 1:
+            return False, None  # stale file from an earlier process with the same PID
+        return True, json.loads(f.read_text()).get("sessionID")
+    except (OSError, ValueError):
+        return False, None
+
+
+def open_db():
+    try:
+        return sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def root_session(db, sid):
+    """Subagent (child) sessions resolve to the top-level session that owns them."""
+    if not db or not sid:
+        return sid
+    for _ in range(20):
+        row = db.execute("select parent_id from session where id = ?", (sid,)).fetchone()
+        if not row or not row[0]:
+            break
+        sid = row[0]
+    return sid
+
+
+def guess_session(db, cwd, claimed):
+    if not db:
+        return None
+    rows = db.execute(
+        "select id from session where directory = ? and parent_id is null"
+        " and time_archived is null order by time_updated desc limit 50", (cwd,))
+    return next((r[0] for r in rows if r[0] not in claimed), None)
+
+
+def resolve_opencode_tabs(pending, quiet=False):
+    """pending: list of (tab, pid, argv). Sets tab['command'] to reopen the right session."""
+    db = open_db()
+    claimed = set()
+    unresolved = []
+    for tab, pid, argv in pending:
+        found, sid = tracked_session(pid)
+        source = "plugin" if found else None
+        if not found and argv_session(argv):
+            sid, source = argv_session(argv), "argv"
+        if source:
+            sid = root_session(db, sid)
+            claimed.add(sid)
+            tab["opencode"] = {"session": sid, "source": source}
+        else:
+            unresolved.append((tab, argv))
+    for tab, argv in unresolved:
+        sid = guess_session(db, tab["cwd"], claimed)
+        claimed.add(sid)
+        tab["opencode"] = {"session": sid, "source": "guess"}
+        quiet or print(f"warning: no tracker record for opencode in {tab['cwd']}; "
+              f"guessed {sid or 'new session'} (restart that opencode to load the plugin)",
+              file=sys.stderr)
+    for tab, _pid, argv in pending:
+        sid = tab["opencode"]["session"]
+        tab["command"] = shlex.join([argv[0]] + (["-s", sid] if sid else []))
+        tab["autorun"] = True
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return str(Path.home())
+
+
+def kwin_windows():
+    """Normal windows of all apps with desktop/geometry, read over KWin D-Bus.
+
+    For placing windows back on their virtual desktops after a reboot. Read-only
+    and journal-free (no KWin script). Listing relies on KRunner's window runner
+    returning every window for an empty query (Plasma 6.7 behaviour, not a
+    documented API), so any failure just omits the data: returns None.
+    """
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        kwin_obj = bus.get_object("org.kde.KWin", "/KWin")
+        kwin = dbus.Interface(kwin_obj, "org.kde.KWin")
+        runner = dbus.Interface(bus.get_object("org.kde.KWin", "/WindowsRunner"), "org.kde.krunner1")
+        vdm = dbus.Interface(bus.get_object("org.kde.KWin", "/VirtualDesktopManager"),
+                             "org.freedesktop.DBus.Properties")
+        desktops = [{"id": str(d[1]), "name": str(d[2])}
+                    for d in vdm.Get("org.kde.KWin.VirtualDesktopManager", "desktops")]
+        windows = []
+        for uid in sorted({str(m[0]).split("_", 1)[-1] for m in runner.Match("")}):
+            info = kwin.getWindowInfo(uid)
+            if not info or int(info.get("type", -1)) != 0:  # 0 = normal window
+                continue
+            if bool(info.get("skipTaskbar")) or bool(info.get("skipSwitcher")):
+                continue
+            windows.append({
+                "uuid": str(info["uuid"]),
+                "pid": int(info["pid"]),
+                "resourceClass": str(info["resourceClass"]),
+                "desktopFile": str(info.get("desktopFile", "")),
+                "caption": str(info["caption"]),
+                "desktops": [str(d) for d in info.get("desktops", [])],  # [] = all desktops
+                "activities": [str(a) for a in info.get("activities", [])],
+                "geometry": [int(info[k]) for k in ("x", "y", "width", "height")],
+                "maximized": bool(info["maximizeHorizontal"]) and bool(info["maximizeVertical"]),
+                "minimized": bool(info["minimized"]),
+                "fullscreen": bool(info["fullscreen"]),
+                "keepAbove": bool(info["keepAbove"]),
+            })
+        return {"desktops": desktops, "windows": windows}
+    except Exception as e:  # noqa: BLE001 - optional data, never break a save
+        print(f"KWin window capture skipped: {e}")
+        return None
+
+
+def plasma_shutting_down():
+    try:
+        return q("org.kde.ksmserver", "/KSMServer",
+                 "org.kde.KSMServerInterface.isShuttingDown") == "true"
+    except RuntimeError:
+        return False  # no ksmserver (not in Plasma): nothing to guard against
+
+
+@contextmanager
+def state_lock(file, blocking):
+    """Serialize save/restore on one state file. Yields False if non-blocking and busy."""
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with open(file.parent / f".{file.name}.lock", "w") as fd:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+
+
+def archive_previous_boot(file):
+    """Keep the last snapshot of the previous boot as <stem>.last-boot.json.
+
+    The first save after a reboot would otherwise overwrite it, losing both the
+    user's state (if restore failed) and the baseline needed to check a restore.
+    """
+    try:
+        data = json.loads(file.read_text())
+    except (OSError, ValueError):
+        return
+    if data.get("boot_id") == boot_id():
+        return
+    arch_screens = file.parent / f"{file.stem}.last-boot.screens"
+    shutil.rmtree(arch_screens, ignore_errors=True)
+    arch_screens.mkdir(parents=True)
+    for win in data["windows"]:
+        for tab in win["tabs"]:
+            if tab.get("screen") and Path(tab["screen"]).exists():
+                dest = arch_screens / Path(tab["screen"]).name
+                shutil.copyfile(tab["screen"], dest)
+                tab["screen"] = str(dest)
+            else:
+                tab["screen"] = None
+    (file.parent / f"{file.stem}.last-boot.json").write_text(json.dumps(data, indent=2))
+    print(f"Archived previous-boot snapshot (boot {data.get('boot_id')}) to "
+          f"{file.stem}.last-boot.json")
+
+
+def save(file, quiet=False):
+    # Skip reasons are always logged (journal), even with --quiet.
+    # Mid-logout, Plasma is closing windows: a snapshot now would be partial.
+    if plasma_shutting_down():
+        print("Plasma is shutting down; keeping the previous snapshot")
+        return
+    with state_lock(file, blocking=False) as locked:
+        if not locked:
+            print("Another save/restore is running; skipped")
+            return
+        save_locked(file, quiet)
+
+
+def save_locked(file, quiet):
+    S = "org.kde.konsole.Session."
+    W = "org.kde.konsole.Window."
+    # One screens dir per snapshot, so the previous snapshot stays intact until
+    # the new JSON has replaced it.
+    stamp = time.strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
+    screens_dir = file.parent / f"{file.stem}.screens-{stamp}"
+    screens_dir.mkdir(parents=True)
+
+    windows = []
+    opencode_tabs = []
+    for svc in services():
+        for wpath in object_paths(svc, "/Windows"):
+            current = q(svc, wpath, W + "currentSession")
+            known_profiles = set(q(svc, wpath, W + "profileList").splitlines())
+            tabs = []
+            for sid in q(svc, wpath, W + "sessionList").splitlines():
+                spath = f"/Sessions/{sid}"
+                shell_pid = int(q(svc, spath, S + "processId"))
+                fg_pid = tty_foreground(shell_pid) or int(q(svc, spath, S + "foregroundProcessId"))
+                screen = screens_dir / f"{svc.split('-')[-1]}-{sid}.txt"
+                screen.write_text(q(svc, spath, S + "getAllDisplayedText", "true") + "\n")
+                argv = proc_argv(fg_pid) if fg_pid > 0 else None
+                if fg_pid == shell_pid and is_shell(argv):
+                    argv = None  # idle shell, nothing to relaunch
+                profile = q(svc, spath, S + "profile")
+                if profile not in known_profiles:
+                    # Hidden clone from a restore: use the name the launcher exported.
+                    # /proc environ is exec-time only: the launcher sh itself lacks
+                    # its own export until it execs the shell, but children have it.
+                    profile = (proc_env(shell_pid).get(PROFILE_ENV)
+                               or proc_env(fg_pid).get(PROFILE_ENV) or profile)
+                tab = {
+                    "profile": profile,
+                    "cwd": proc_cwd(fg_pid if fg_pid > 0 else shell_pid),
+                    "command": shlex.join(argv) if argv else None,
+                    "screen": str(screen),
+                    "current": sid == current,
+                }
+                if is_opencode(argv):
+                    # A full-screen TUI's screen dump is noise once replayed.
+                    tab["screen"] = None
+                    screen.unlink()
+                    opencode_tabs.append((tab, fg_pid, argv))
+                tabs.append(tab)
+            if tabs:
+                pid = svc.rsplit("-", 1)[-1]
+                windows.append({"tabs": tabs, "pid": int(pid) if pid.isdigit() else None})
+
+    if not windows:
+        # Also covers login, before restore has opened anything.
+        shutil.rmtree(screens_dir)
+        print("No Konsole windows; keeping the previous snapshot")
+        return
+
+    resolve_opencode_tabs(opencode_tabs, quiet)
+    prune_trackers()
+    kwin = kwin_windows()
+    if kwin:
+        # Konsole windows: exact desktop by PID (one window per --separate process).
+        for win in windows:
+            mine = [w for w in kwin["windows"] if w["pid"] == win["pid"]]
+            if len(mine) == 1:
+                win["desktops"] = mine[0]["desktops"]
+                win["geometry"] = mine[0]["geometry"]
+                win["maximized"] = mine[0]["maximized"]
+    archive_previous_boot(file)
+
+    tmp = file.with_name(f".{file.name}.tmp")
+    tmp.write_text(json.dumps(
+        {"saved_at": time.time(), "boot_id": boot_id(), "windows": windows, "kwin": kwin},
+        indent=2))
+    os.replace(tmp, file)  # atomic: a crash leaves either the old or the new snapshot
+    for old in file.parent.glob(f"{file.stem}.screens*"):
+        if old != screens_dir:
+            shutil.rmtree(old, ignore_errors=True) if old.is_dir() else old.unlink()
+    log(f"Saved {len(windows)} window(s), {sum(len(w['tabs']) for w in windows)} tab(s) to {file}",
+        quiet)
+
+
+def log(msg, quiet=False):
+    if not quiet:
+        print(msg)
+
+
+def wait_for_service(name, timeout=30.0):
+    # Generous: at login many windows start at once, each with opencode + MCP servers.
+    end = time.time() + timeout
+    while time.time() < end:
+        if name in services():
+            try:
+                q(name, "/Sessions/1", "org.kde.konsole.Session.processId")
+                return
+            except RuntimeError:
+                pass
+        time.sleep(0.2)
+    raise RuntimeError(f"Konsole service {name} did not appear")
+
+
+def tab_launcher(path, tab, run):
+    """Shell script a restored tab starts with: replay screen, (re)run command, then a shell.
+
+    Konsole blocks sendText/runCommand over D-Bus by default ("security sensitive
+    DBus API"), so tabs are started with this script via --tabs-from-file instead.
+    """
+    lines = ["#!/bin/sh", f"cd -- {shlex.quote(tab['cwd'])} 2>/dev/null"]
+    if tab.get("profile"):
+        # A tabs-file `command:` makes Konsole run the tab in a hidden clone of the
+        # profile ("Profile 1"); this lets the next save recover the real name.
+        lines.append(f"export {PROFILE_ENV}={shlex.quote(tab['profile'])}")
+    if tab.get("screen") and Path(tab["screen"]).exists():
+        # Copy next to the launcher: the next timed save deletes the snapshot's screens.
+        screen = path.with_suffix(".screen")
+        shutil.copyfile(tab["screen"], screen)
+        lines.append(f"cat -- {shlex.quote(str(screen))}")
+    cmd = tab.get("command")
+    if cmd:
+        if run or tab.get("autorun"):
+            # Interactive shell so rc-file PATH/aliases are available to the command.
+            lines.append(f'"${{SHELL:-/bin/sh}}" -ic {shlex.quote(cmd)}')
+        else:
+            lines.append(f"printf '\\n[konsole-state] previous command: %s\\n' {shlex.quote(cmd)}")
+    lines.append('exec "${SHELL:-/bin/sh}"')
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o755)
+
+
+PLACE_DURATION = 120  # s: JetBrains IDEs and Firefox session restore can be slow at login
+PLACE_GRACE = 20      # s a window must exist before the "only one of its app" fallback
+FIREFOX_SUFFIXES = (" — Mozilla Firefox", " - Mozilla Firefox")
+
+
+def run_kwin_script(js):
+    """Load, run and unload a one-off KWin script (prints nothing to any journal)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / f".kwin-{os.getpid()}-{time.time_ns()}.js"
+    path.write_text(js)
+    try:
+        sid = q("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript",
+                str(path), path.stem)
+        q("org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
+        time.sleep(0.3)
+    finally:
+        try:
+            q("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", path.stem)
+        except RuntimeError:
+            pass
+        path.unlink(missing_ok=True)
+
+
+def move_windows(moves):
+    """moves: {window uuid: {"desktops": [ids] ([] = all desktops),
+                             "geometry": [x, y, w, h] | None, "maximized", "fullscreen"}}.
+
+    Geometry is in global coordinates, so it also selects the monitor. It is only
+    applied if its centre lies on a current monitor (layout may have changed,
+    e.g. laptop undocked); otherwise only the desktops are restored.
+    """
+    run_kwin_script("const moves = " + json.dumps(moves) + ";\n" + """
+function onScreen(g) {
+    const cx = g[0] + g[2] / 2, cy = g[1] + g[3] / 2;
+    return workspace.screens.some(s => cx >= s.geometry.x && cx < s.geometry.x + s.geometry.width
+                                    && cy >= s.geometry.y && cy < s.geometry.y + s.geometry.height);
+}
+for (const w of workspace.windowList()) {
+    const want = moves[w.internalId.toString()];
+    if (want === undefined) continue;
+    if (want.desktops.length === 0) {
+        w.onAllDesktops = true;
+    } else {
+        const ds = workspace.desktops.filter(d => want.desktops.includes(d.id));
+        if (ds.length) w.desktops = ds;
+    }
+    if (want.geometry && onScreen(want.geometry)) {
+        if (w.fullScreen) w.fullScreen = false;
+        w.setMaximize(false, false);
+        const g = want.geometry;
+        w.frameGeometry = {x: g[0], y: g[1], width: g[2], height: g[3]};
+        if (want.maximized) w.setMaximize(true, true);
+        if (want.fullscreen) w.fullScreen = true;
+    }
+}
+""")
+
+
+def layout_of(w):
+    """The part of a window's state that placement restores."""
+    return {"desktops": w["desktops"], "geometry": w.get("geometry"),
+            "maximized": w.get("maximized", False), "fullscreen": w.get("fullscreen", False)}
+
+
+def layout_matches(live, want, tolerance=8):
+    if sorted(live["desktops"]) != sorted(want["desktops"]):
+        return False
+    if want["geometry"] is None:
+        return True
+    if live["maximized"] != want["maximized"] or live.get("fullscreen", False) != want["fullscreen"]:
+        return False
+    return all(abs(a - b) <= tolerance for a, b in zip(live["geometry"], want["geometry"]))
+
+
+def describe(want, names):
+    where = ", ".join(names.get(d, d) for d in want["desktops"]) or "all desktops"
+    g = want["geometry"]
+    if g:
+        where += f" @ {g[0]},{g[1]}" + (" maximized" if want["maximized"] else f" {g[2]}x{g[3]}")
+    return where
+
+
+def norm_caption(caption):
+    for suffix in FIREFOX_SUFFIXES:
+        if caption.endswith(suffix):
+            return caption[:-len(suffix)].strip()
+    return caption.strip()
+
+
+def jetbrains_project(window):
+    cls, caption = window["resourceClass"], window["caption"]
+    if cls.startswith("jetbrains-") and " – " in caption:
+        return caption.split(" – ", 1)[0].strip()
+    return None
+
+
+def match_tiers(grace_ok):
+    """(name, predicate(live, saved, live_pending, saved_unused)) from most to least certain."""
+    def same_class(a, b):
+        return a["resourceClass"] == b["resourceClass"]
+
+    def only_one(live, saved, live_pending, saved_unused):
+        cls = live["resourceClass"]
+        return (grace_ok(live)
+                and sum(w["resourceClass"] == cls for w in live_pending) == 1
+                and sum(s["resourceClass"] == cls for s in saved_unused) == 1)
+
+    return [
+        ("exact title", lambda l, s, *_: same_class(l, s) and l["caption"] == s["caption"]),
+        ("title", lambda l, s, *_: same_class(l, s) and norm_caption(l["caption"])
+            and norm_caption(l["caption"]) == norm_caption(s["caption"])),
+        ("project", lambda l, s, *_: same_class(l, s) and jetbrains_project(l)
+            and jetbrains_project(l) == jetbrains_project(s)),
+        ("only window of its app", lambda l, s, lp, su: same_class(l, s) and only_one(l, s, lp, su)),
+    ]
+
+
+def place_windows(data, konsole_targets, duration=PLACE_DURATION, dry_run=False, evidence=False):
+    """Put windows back on their saved virtual desktops.
+
+    konsole_targets: {new konsole pid: [desktop ids]} for windows restore just
+    launched (exact). Other apps are matched to the snapshot's KWin data by
+    app + title, most certain first; anything uncertain is left alone.
+    Runs until every saved window is placed or `duration` expires.
+    """
+    saved = [w for w in (data.get("kwin") or {}).get("windows", [])
+             if w["resourceClass"] != "org.kde.konsole"]
+    konsole_targets = dict(konsole_targets)
+    if not saved and not konsole_targets:
+        print("place: no saved window layout in snapshot")
+        return
+    unused = list(saved)
+    placed, first_seen, applied, moved = set(), {}, {}, set()
+    names, moved_total = {}, 0
+    start = time.time()
+    while True:
+        live = kwin_windows()
+        if live is None:
+            break
+        names.update({d["id"]: d["name"] for d in live["desktops"]})
+        now = time.time()
+        for w in live["windows"]:
+            first_seen.setdefault(w["uuid"], now)
+        pending = [w for w in live["windows"] if w["uuid"] not in placed]
+        decisions = []  # (live, wanted layout, how)
+        for w in pending:
+            if w["pid"] in konsole_targets:
+                decisions.append((w, konsole_targets.pop(w["pid"]), "restored konsole"))
+        decided = {d[0]["uuid"] for d in decisions}
+        grace_ok = (lambda w: True) if dry_run else (lambda w: now - first_seen[w["uuid"]] >= PLACE_GRACE)
+        for how, pred in match_tiers(grace_ok):
+            for w in pending:
+                if w["uuid"] in decided or w["resourceClass"] == "org.kde.konsole":
+                    continue
+                live_pending = [x for x in pending if x["uuid"] not in decided]
+                s = next((s for s in unused if pred(w, s, live_pending, unused)), None)
+                if s:
+                    unused.remove(s)
+                    decided.add(w["uuid"])
+                    decisions.append((w, layout_of(s), how))
+        moves = {}
+        for w, want, how in decisions:
+            placed.add(w["uuid"])
+            label = f"{w['resourceClass']} {w['caption'][:50]!r}"
+            if [d for d in want["desktops"] if d not in names]:
+                print(f"place: {label}: saved desktop no longer exists; left alone")
+            elif layout_matches(w, want):
+                print(f"place: {label} already at {describe(want, names)} ({how})")
+            else:
+                print(f"place: {label} -> {describe(want, names)} ({how})"
+                      + (" [dry run]" if dry_run else ""))
+                moves[w["uuid"]] = want
+        if moves and not dry_run:
+            move_windows(moves)
+            moved_total += len(moves)
+            moved.update(moves)
+            time.sleep(0.5)
+            # Self-check: report what did not end up where it should.
+            after = {w["uuid"]: w for w in (kwin_windows() or {}).get("windows", [])}
+            for uid, want in moves.items():
+                got = after.get(uid)
+                if got and not layout_matches(got, want):
+                    print(f"place: MISMATCH {got['resourceClass']} {got['caption'][:50]!r}: "
+                          f"wanted {describe(want, names)}, got {describe(layout_of(got), names)}"
+                          " (saved position not on a current monitor?)")
+                else:
+                    applied[uid] = want  # landed; re-checked by settle()
+        if dry_run or (not unused and not konsole_targets) or now - start > duration:
+            break
+        time.sleep(1)
+    if applied:
+        settle(applied, names)
+    if moved:
+        if evidence:
+            for old in EVIDENCE_DIR.glob("*.png"):
+                old.unlink()
+            panel_screenshot("1-after-placement")
+        clear_attention_off_desktop(moved)
+        print("place: cleared attention flags on moved windows not on the current desktop")
+        if evidence:
+            time.sleep(1)
+            panel_screenshot("2-after-clearing-attention")
+    for s in unused:
+        print(f"place: not found: {s['resourceClass']} {s['caption'][:50]!r}")
+    print(f"place: done in {time.time() - start:.0f}s - moved {moved_total}, "
+          f"{len(saved) - len(unused)}/{len(saved)} app windows matched, "
+          f"{len(konsole_targets)} restored konsole window(s) not seen")
+
+
+PANEL_STRIP = 48  # logical px captured at the top of each monitor (panel is 46 px)
+EVIDENCE_DIR = STATE_DIR / "panels"
+
+
+def clear_attention_off_desktop(uuids):
+    """Clear "demands attention" on moved windows that are not on the current desktop.
+
+    At login Firefox's session restore leaves windows flagged as demanding
+    attention, and Plasma's task manager shows such windows even when they are
+    on another virtual desktop. A window placed onto another desktop therefore
+    stayed on the panel until clicked. Windows on the current desktop keep their
+    flag (they are listed there anyway).
+    """
+    run_kwin_script(f"const ids = {json.dumps(sorted(uuids))};\n" + """
+const cur = workspace.currentDesktop.id;
+for (const w of workspace.windowList()) {
+    if (!ids.includes(w.internalId.toString()) || w.onAllDesktops) continue;
+    if (!w.desktops.some(d => d.id === cur) && w.demandsAttention) w.demandsAttention = false;
+}
+""")
+
+
+def panel_screenshot(name):
+    """Save just the top panel strip of every monitor (evidence for task-manager
+    staleness). Crops a full-desktop capture; nothing else of the screen is kept.
+    """
+    try:
+        outputs = [o for o in json.loads(subprocess.run(
+            ["kscreen-doctor", "-j"], capture_output=True, text=True, check=True).stdout)["outputs"]
+            if o.get("enabled")]
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        full = EVIDENCE_DIR / ".full.png"
+        subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(full)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        width_px = int(subprocess.run(["magick", "identify", "-format", "%w", str(full)],
+                                      capture_output=True, text=True, check=True).stdout)
+        right = max(o["pos"]["x"] + o["size"]["width"] / o["scale"] for o in outputs)
+        k = width_px / right  # capture scale (2x here, because of the 1.9x laptop screen)
+        crops = []
+        for o in sorted(outputs, key=lambda o: (o["pos"]["y"], o["pos"]["x"])):
+            w, h = o["size"]["width"] / o["scale"] * k, PANEL_STRIP * k
+            crops += ["(", "-clone", "0", "-crop",
+                      f"{int(w)}x{int(h)}+{int(o['pos']['x'] * k)}+{int(o['pos']['y'] * k)}", ")"]
+        out = EVIDENCE_DIR / f"{name}.png"
+        subprocess.run(["magick", str(full), *crops, "-delete", "0", "+repage", "-background", "black",
+                        "-append", "-resize", "50%", str(out)], check=True)
+        full.unlink()
+        print(f"place: panel screenshot {out}")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        print(f"place: panel screenshot skipped: {e}")
+    finally:
+        (EVIDENCE_DIR / ".full.png").unlink(missing_ok=True)
+
+
+SETTLE_DELAY = 5  # s after placement before checking that apps left windows alone
+
+
+def settle(applied, names):
+    """Re-check placed windows once apps have settled; re-apply drift once.
+
+    Apps may resize/move their own window after it first maps (late session
+    restore, project load). Logged, so the journal shows whether this happens.
+    """
+    time.sleep(SETTLE_DELAY)
+    live = {w["uuid"]: w for w in (kwin_windows() or {}).get("windows", [])}
+    drifted = {u: want for u, want in applied.items()
+               if u in live and not layout_matches(live[u], want)}
+    if not drifted:
+        print(f"place: settled - {len(applied)} placed window(s) unchanged after {SETTLE_DELAY}s")
+        return
+    for u in drifted:
+        print(f"place: drift {live[u]['resourceClass']} {live[u]['caption'][:50]!r}: "
+              f"now {describe(layout_of(live[u]), names)}; re-applying")
+    move_windows(drifted)
+    time.sleep(0.5)
+    live = {w["uuid"]: w for w in (kwin_windows() or {}).get("windows", [])}
+    for u, want in drifted.items():
+        if u in live and not layout_matches(live[u], want):
+            print(f"place: MISMATCH after re-apply {live[u]['resourceClass']} "
+                  f"{live[u]['caption'][:50]!r}: wanted {describe(want, names)}")
+
+
+def konsole_windows():
+    """[(service, window_count, cmdline)] of running Konsole instances."""
+    found = []
+    for svc in services():
+        try:
+            n = len(object_paths(svc, "/Windows"))
+        except RuntimeError:
+            continue  # instance exiting
+        if n:
+            pid = svc.rsplit("-", 1)[-1]
+            found.append((svc, n, shlex.join(proc_argv(pid) or [])))
+    return found
+
+
+POST_RESTORE_DELAY = 45  # seconds: let shells and opencode TUIs (and their tracker) start
+
+
+def restore(file, run, if_none=False, check=True, evidence=False):
+    uptime = Path("/proc/uptime").read_text().split()[0]
+    print(f"restore: start (uptime {uptime}s, boot {boot_id()}) from {file}")
+    if not file.exists():
+        print(f"No snapshot at {file}; nothing to restore")
+        return
+    snapshot = json.loads(file.read_text())  # read once: the timer may replace the file
+    skip = False
+    if if_none:
+        existing = konsole_windows()
+        if existing:
+            print("Konsole windows already open; not restoring (--if-none):")
+            for svc, n, cmd in existing:
+                print(f"  {svc}: {n} window(s): {cmd}")
+            skip = True
+    expected, konsole_targets = None, {}
+    if not skip:
+        # Blocking: the timer must not snapshot a half-restored set of windows.
+        with state_lock(file, blocking=True):
+            expected, konsole_targets = restore_locked(file, run)
+    restored_at = time.time()
+    # Other apps' windows too, even when the Konsole restore was skipped.
+    place_windows(snapshot, konsole_targets, evidence=evidence)
+    if check and expected:
+        # Self-check, logged to the journal at login: snapshot what actually came
+        # back and compare it with what was restored.
+        time.sleep(max(0.0, POST_RESTORE_DELAY - (time.time() - restored_at)))
+        post = file.with_name(f"{file.stem}.post-restore.json")
+        save(post, quiet=True)
+        verify(expected, post)
+
+
+def restore_locked(file, run):
+    data = json.loads(file.read_text())
+    launch_dir = file.parent / (file.stem + ".launch")
+    launch_dir.mkdir(parents=True, exist_ok=True)
+    for old in launch_dir.glob("*"):
+        old.unlink()
+
+    current_targets = []
+    konsole_targets = {}  # new konsole pid -> saved desktop ids
+    for wi, win in enumerate(data["windows"]):
+        tabs = win["tabs"]
+        spec = []
+        for ti, tab in enumerate(tabs):
+            script = launch_dir / f"w{wi}-t{ti}.sh"
+            tab_launcher(script, tab, run)
+            # Point the input copy at the stable screen copy for verify().
+            screen_copy = script.with_suffix(".screen")
+            tab["screen"] = str(screen_copy) if screen_copy.exists() else None
+            oc = tab.get("opencode")
+            print(f"  window {wi} tab {ti}: {tab['cwd']}"
+                  + (f"  opencode={oc['session'] or 'home'} ({oc['source']})" if oc else "")
+                  + (f"  cmd={tab['command']!r}" if tab.get("command") and not oc else ""))
+            fields = [f"workdir: {tab['cwd']}", f"command: /bin/sh {shlex.quote(str(script))}"]
+            if tab.get("profile"):
+                fields.append(f"profile: {tab['profile']}")
+            spec.append(";; ".join(fields))
+        args = ["konsole", "--separate"]
+        if len(tabs) > 1:
+            tabs_file = launch_dir / f"w{wi}.tabs"
+            tabs_file.write_text("\n".join(spec[:-1]) + "\n")
+            args += ["--tabs-from-file", str(tabs_file)]
+        # Konsole always adds one default tab after the tabs-file tabs. Make it the
+        # last saved tab instead of closing an extra one: closing the active tab of
+        # an unfocused window (focus is elsewhere at login) leaves Konsole with no
+        # active tab (currentSession -1).
+        last = tabs[-1]
+        args += ["--workdir", last["cwd"]]
+        if last.get("profile"):
+            args += ["--profile", last["profile"]]
+        if win.get("geometry"):
+            # Open at the saved size (client area = frame minus title bar) rather than
+            # Konsole's last-closed size; placement fixes position and any remainder.
+            w, h = win["geometry"][2], win["geometry"][3] - TITLEBAR_HEIGHT
+            args += ["-qwindowgeometry", f"{w}x{max(h, 150)}"]
+        args += ["-e", "/bin/sh", str(launch_dir / f"w{wi}-t{len(tabs) - 1}.sh")]
+
+        # Konsole moves itself into its own app-org.kde.konsole-<pid>.scope, so the
+        # window outlives the caller (login autostart unit or a terminal tab).
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        if "desktops" in win:
+            konsole_targets[proc.pid] = layout_of(win)
+        t0 = time.time()
+        try:
+            target = finish_window(proc, tabs)
+            if target:
+                current_targets.append(target)
+            print(f"restore: window {wi}: {len(tabs)} tab(s), konsole pid {proc.pid}, "
+                  f"ready in {time.time() - t0:.1f}s")
+        except RuntimeError as e:
+            # The window may still have opened; only tab focus/cleanup failed.
+            print(f"warning: window {wi} (konsole pid {proc.pid}): {e}", file=sys.stderr)
+    reassert_current_tabs(current_targets)
+    print(f"Restored {len(data['windows'])} window(s) from {file}")
+    expected = launch_dir / "input.json"
+    expected.write_text(json.dumps(data, indent=2))
+    return expected, konsole_targets
+
+
+def tab_key(tab):
+    """What must survive a restore. Plain commands are only shown, not re-run."""
+    oc = tab.get("opencode")
+    return (tab["cwd"], tab.get("profile"), ("opencode", oc["session"]) if oc else None)
+
+
+def screen_restored(expected_tab, actual_tab):
+    """At least half the saved screen's non-empty lines are on the new screen."""
+    try:
+        want = [l.strip() for l in Path(expected_tab["screen"]).read_text().splitlines() if l.strip()]
+        have = set(l.strip() for l in Path(actual_tab["screen"]).read_text().splitlines())
+    except (OSError, TypeError, KeyError):
+        return False
+    return not want or sum(l in have for l in want) * 2 >= len(want)
+
+
+def verify(expected_file, actual_file):
+    """Compare a restored snapshot with the snapshot taken after restore. Returns 0 if OK."""
+    exp = json.loads(Path(expected_file).read_text())["windows"]
+    try:
+        act = json.loads(Path(actual_file).read_text())["windows"]
+    except (OSError, ValueError) as e:
+        print(f"verify: FAIL cannot read {actual_file}: {e}")
+        return 1
+    problems = 0
+    unused = list(range(len(act)))
+    for wi, ew in enumerate(exp):
+        # Windows have new PIDs/order after a restore: pair each with its best match.
+        def score(ai):
+            pairs = list(zip(act[ai]["tabs"], ew["tabs"]))
+            return (sum(a["cwd"] == e["cwd"] for a, e in pairs),
+                    sum(tab_key(a) == tab_key(e) for a, e in pairs),
+                    len(act[ai]["tabs"]) == len(ew["tabs"]))
+        if not unused:
+            print(f"verify: FAIL window {wi} ({len(ew['tabs'])} tabs, {ew['tabs'][0]['cwd']}): missing")
+            problems += 1
+            continue
+        ai = max(unused, key=score)
+        unused.remove(ai)
+        aw = act[ai]
+        if len(aw["tabs"]) != len(ew["tabs"]):
+            print(f"verify: FAIL window {wi}: {len(ew['tabs'])} tabs expected, {len(aw['tabs'])} found")
+            problems += 1
+        for ti, (e, a) in enumerate(zip(ew["tabs"], aw["tabs"])):
+            issues = []
+            if tab_key(e) != tab_key(a):
+                issues.append(f"expected {tab_key(e)}, found {tab_key(a)}"
+                              + (f" (source {a['opencode']['source']})" if a.get("opencode") else ""))
+            if e.get("current") and not a.get("current"):
+                # Konsole reports the active tab only for a focused window, so this
+                # can be a stale readback rather than a wrong tab: note, not FAIL.
+                print(f"verify: note: window {wi} tab {ti} ({e['cwd']}) should be the active tab; "
+                      "Konsole reports otherwise (unreliable while the window is unfocused)")
+            if e.get("screen") and not screen_restored(e, a):
+                issues.append("saved screen text not found on restored screen")
+            if issues:
+                problems += 1
+                print(f"verify: FAIL window {wi} tab {ti} ({e['cwd']}): " + "; ".join(issues))
+    for ai in unused:
+        print(f"verify: note: extra window not in snapshot ({len(act[ai]['tabs'])} tabs, "
+              f"{act[ai]['tabs'][0]['cwd']}) - opened manually?")
+    n_tabs = sum(len(w["tabs"]) for w in exp)
+    print(f"verify: {'OK' if not problems else f'{problems} problem(s)'} - "
+          f"{len(exp)} window(s), {n_tabs} tab(s) checked against {actual_file}")
+    return 1 if problems else 0
+
+
+TITLEBAR_HEIGHT = 28  # px, Breeze at scale 1; only used for the initial window size
+
+
+def finish_window(proc, tabs):
+    """Wait for the window, check its tab count, select the saved active tab."""
+    W = "org.kde.konsole.Window."
+    svc = f"org.kde.konsole-{proc.pid}"
+    wait_for_service(svc)
+    wpath = object_paths(svc, "/Windows")[0]
+    sids = [int(s) for s in q(svc, wpath, W + "sessionList").splitlines()]
+    if len(sids) != len(tabs):
+        print(f"warning: {svc}: {len(tabs)} tab(s) expected, {len(sids)} opened", file=sys.stderr)
+    target = next((sid for sid, tab in zip(sids, tabs) if tab.get("current")), None)
+    if target is None:
+        return None
+    # Konsole activates the last tab by itself shortly after its D-Bus service
+    # appears. Readback works while the window has focus: wait briefly for that
+    # switch so ours lands after it. If focus is elsewhere the readback is stale
+    # (the switch itself still happens), so just time out quietly.
+    end = time.time() + 1.5
+    while time.time() < end and q(svc, wpath, W + "currentSession") != str(sids[-1]):
+        time.sleep(0.1)
+    q(svc, wpath, W + "setCurrentSession", target)
+    return (svc, wpath, target)
+
+
+def reassert_current_tabs(targets):
+    """Select each window's saved tab once more after all windows are up.
+
+    Konsole's currentSession readback only updates while a window has focus, so
+    it cannot confirm this at login; a blind, idempotent re-set covers a late
+    switch by Konsole without waiting on a value that may never change.
+    """
+    time.sleep(1)
+    for svc, wpath, target in targets:
+        try:
+            q(svc, wpath, "org.kde.konsole.Window.setCurrentSession", target)
+        except RuntimeError:
+            pass  # window closed by the user
+
+
+def main(argv):
+    # Line-buffered so journal output survives if the unit is killed mid-run.
+    sys.stdout.reconfigure(line_buffering=True)
+    if len(argv) < 2 or argv[1] not in ("save", "restore", "verify", "place", "doctor"):
+        print(__doc__)
+        return 2
+    if argv[1] == "doctor":
+        return doctor()
+    rest = [a for a in argv[2:] if not a.startswith("--")]
+    if argv[1] == "verify":
+        if len(rest) != 2:
+            print("usage: konsole-state verify EXPECTED.json ACTUAL.json")
+            return 2
+        return verify(*rest)
+    # Absolute: tab launchers run from each tab's own workdir.
+    file = (Path(rest[0]).expanduser() if rest else DEFAULT_FILE).resolve()
+    if argv[1] == "save":
+        save(file, quiet="--quiet" in argv)
+    elif argv[1] == "place":
+        # Konsole windows are only placed by restore (exact PID match).
+        place_windows(json.loads(file.read_text()), {}, dry_run="--dry-run" in argv)
+    else:
+        restore(file, run="--run" in argv, if_none="--if-none" in argv,
+                check="--no-check" not in argv, evidence="--evidence" in argv)
+    return 0
+
+
+def doctor():
+    """Check every system dependency and undocumented behaviour this tool relies on."""
+    results = []
+
+    def check(level, name, ok, detail="", hint=""):
+        """detail is always shown; hint only when the check does not pass."""
+        shown = "; ".join(x for x in (detail, "" if ok else hint) if x)
+        results.append((("OK  " if ok else level), name, shown))
+
+    def run(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    check("FAIL", "qdbus (Qt 6)", bool(shutil.which(QDBUS) or os.access(QDBUS, os.X_OK)), QDBUS)
+    try:
+        import dbus  # noqa: F401
+        check("FAIL", "python3 dbus module", True)
+    except ImportError:
+        check("WARN", "python3 dbus module", False,
+              hint="window placement is skipped; install python3-dbus / python-dbus")
+    plasma = run("plasmashell", "--version")
+    major = int(plasma.split()[-1].split(".")[0]) if plasma[-1:].isdigit() else 0
+    check("FAIL", "Plasma 6", major >= 6, plasma or "plasmashell not found")
+    check("FAIL", "konsole", bool(shutil.which("konsole")), run("konsole", "--version"))
+    check("WARN", "Wayland session", os.environ.get("XDG_SESSION_TYPE") == "wayland",
+          hint=f"XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE')}; only Wayland is tested")
+
+    # Konsole D-Bus surface used for saving (needs a running Konsole).
+    svcs = services()
+    if svcs:
+        svc = svcs[0]
+        try:
+            methods = q(svc, "/Sessions/1")
+            for m in ("getAllDisplayedText", "foregroundProcessId", "profile"):
+                check("FAIL", f"Konsole D-Bus Session.{m}", m in methods)
+            check("FAIL", "Konsole D-Bus Window.profileList",
+                  "profileList" in q(svc, object_paths(svc, "/Windows")[0]))
+        except (RuntimeError, IndexError) as e:
+            check("WARN", "Konsole D-Bus", False, str(e))
+    else:
+        check("WARN", "Konsole D-Bus", False, hint="no Konsole running; open one and re-run doctor")
+
+    # KWin: window listing (undocumented KRunner behaviour) and scripting.
+    live = kwin_windows()
+    check("WARN", "KWin window listing (KRunner empty query)", bool(live and live["windows"]),
+          f"{len(live['windows'])} windows" if live else "", hint="window placement will be skipped")
+    try:
+        check("WARN", "KWin scripting", "loadScript" in q("org.kde.KWin", "/Scripting"))
+    except RuntimeError as e:
+        check("WARN", "KWin scripting", False, str(e))
+    try:
+        state = q("org.kde.ksmserver", "/KSMServer", "org.kde.KSMServerInterface.isShuttingDown")
+        check("WARN", "ksmserver isShuttingDown", state in ("true", "false"))
+    except RuntimeError as e:
+        check("WARN", "ksmserver isShuttingDown", False, str(e))
+
+    # Session integration.
+    check("FAIL", "systemd graphical-session.target active",
+          run("systemctl", "--user", "is-active", "graphical-session.target") == "active",
+          hint="Plasma must be started with systemd (the default) for the save timer")
+    check("FAIL", "save timer active",
+          run("systemctl", "--user", "is-active", "konsole-state.timer") == "active")
+    autostart = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart/konsole-state-restore.desktop"
+    check("FAIL", "login restore autostart entry", autostart.exists(), hint=f"missing {autostart}")
+    exclude = run("kreadconfig6", "--file", "ksmserverrc", "--group", "General", "--key", "excludeApps")
+    check("WARN", "Konsole excluded from Plasma session restore",
+          "org.kde.konsole.desktop" in exclude.replace(":", ",").split(","),
+          hint="otherwise Plasma opens an extra blank Konsole at login")
+    try:
+        snap = json.loads(DEFAULT_FILE.read_text())
+        age = time.time() - snap["saved_at"]
+        check("WARN", "recent snapshot", age < 180, f"{age:.0f}s old, {len(snap['windows'])} window(s)",
+              hint="saves are skipped while no Konsole window is open")
+    except (OSError, ValueError, KeyError):
+        check("WARN", "recent snapshot", False, hint=f"none at {DEFAULT_FILE} yet")
+
+    # Optional components.
+    if shutil.which("opencode"):
+        tracked = [f for f in OC_TRACKER_DIR.glob("*.json") if tracker_live(f)] if OC_TRACKER_DIR.exists() else []
+        check("WARN", "opencode session tracker plugin reporting", bool(tracked),
+              f"{len(tracked)} running instance(s)", "restart opencode after installing the plugin")
+    for tool in ("spectacle", "magick", "kscreen-doctor"):
+        check("INFO", f"{tool} (only for --evidence)", bool(shutil.which(tool)))
+
+    for level, name, detail in results:
+        print(f"[{level}] {name}" + (f" - {detail}" if detail else ""))
+    return 1 if any(level == "FAIL" for level, _, _ in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
