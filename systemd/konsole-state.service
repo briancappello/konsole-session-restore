@@ -1,5 +1,6 @@
 [Unit]
 Description=Snapshot Konsole windows, tabs and window placement
+Documentation=https://github.com/briancappello/konsole-session-restore
 
 [Service]
 Type=oneshot
