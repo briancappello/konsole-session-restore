@@ -47,7 +47,7 @@ The installer writes these files:
 - `~/.local/bin/konsole-state`
 - `~/.config/systemd/user/konsole-state.service` and `konsole-state.timer`
 - `~/.config/autostart/konsole-state-restore.desktop`
-- `~/.config/opencode/tui-plugins/konsole-session-tracker.ts` and `konsole-agent-status.ts`, and an entry for each in the `plugins` list of `~/.config/opencode/cli.json` (only if opencode is installed)
+- `~/.config/opencode/tui-plugins/konsole-session-tracker/tui.ts` and `konsole-agent-status/tui.ts`, and an entry for each directory in the `plugins` list of `~/.config/opencode/cli.json` (only if opencode is installed). opencode ignores an entry that points to a single file.
 
 The installer also adds Konsole to `excludeApps` in `ksmserverrc`. This is the System Settings field "Applications to be excluded from sessions". Without it, Plasma opens an extra empty Konsole window at login. The installer keeps the applications that you already excluded.
 

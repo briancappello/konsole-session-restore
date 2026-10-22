@@ -19,7 +19,7 @@ MANIFEST="${STATE}/install-manifest.json"
 systemctl --user disable --now konsole-state.timer >/dev/null 2>&1 || true
 
 MANIFEST="$MANIFEST" python3 - <<'PY'
-import json, os, re, subprocess
+import json, os, re, shutil, subprocess
 from pathlib import Path
 
 m = json.loads(Path(os.environ["MANIFEST"]).read_text())
@@ -53,7 +53,10 @@ for conf, plugin in entries:
     except (OSError, ValueError):
         print(f"NOTE: remove \"{plugin}\" from {conf} by hand")
 for plugin in plugins:
-    Path(plugin).unlink(missing_ok=True)
+    if Path(plugin).is_dir():
+        shutil.rmtree(plugin)
+    else:
+        Path(plugin).unlink(missing_ok=True)
     print(f"removed {plugin}")
 PY
 

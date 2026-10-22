@@ -97,6 +97,8 @@ manifest["exclude_apps_added"] = sorted(set(manifest.get("exclude_apps_added", [
 # Optional opencode TUI plugins: the session tracker (used by restore) and the
 # agent status glyph in the tab title. opencode 2 loads terminal plugins from
 # the "plugins" list in cli.json (opencode 1 used tui.json; see tag opencode-v1).
+# Each plugin must be a directory with a tui.ts entrypoint: opencode 2 silently
+# ignores a cli.json entry that points at a single file.
 if env["WITH_OPENCODE"] == "yes":
     oc = Path(env["CONFIG"]) / "opencode"
     cli = oc / "cli.json"
@@ -110,9 +112,14 @@ if env["WITH_OPENCODE"] == "yes":
     manifest.pop("tui_json_entries", None)
     for name, label in (("konsole-session-tracker.ts", "session tracker"),
                         ("konsole-agent-status.ts", "agent status")):
-        plugin = oc / "tui-plugins" / name
-        plugin.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(Path(env["REPO"]) / "opencode" / name, plugin)
+        plugin = oc / "tui-plugins" / Path(name).stem
+        plugin.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(env["REPO"]) / "opencode" / name, plugin / "tui.ts")
+        # Earlier versions installed the plugin as a single file.
+        legacy = str(oc / "tui-plugins" / name)
+        Path(legacy).unlink(missing_ok=True)
+        plugins_installed[:] = [p for p in plugins_installed if p != legacy]
+        entries[:] = [e for e in entries if e != [str(cli), legacy]]
         if str(plugin) not in plugins_installed:
             plugins_installed.append(str(plugin))
         try:
@@ -121,8 +128,11 @@ if env["WITH_OPENCODE"] == "yes":
             print(f"NOTE: {cli} is not plain JSON; add \"{plugin}\" to its \"plugins\" list by hand")
             continue
         plugins = cfg.setdefault("plugins", [])
+        before = list(plugins)
+        plugins[:] = [p for p in plugins if p != legacy]
         if str(plugin) not in plugins:
             plugins.append(str(plugin))
+        if plugins != before:
             cli.write_text(json.dumps(cfg, indent=2) + "\n")
         if [str(cli), str(plugin)] not in entries:
             entries.append([str(cli), str(plugin)])
