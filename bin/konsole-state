@@ -196,12 +196,19 @@ def open_db():
         return None
 
 
+def session_table(db):
+    """opencode 2 keeps sessions in session_v2; the old session table stops at the upgrade."""
+    found = db.execute("select 1 from sqlite_master where type = 'table' and name = 'session_v2'").fetchone()
+    return "session_v2" if found else "session"
+
+
 def root_session(db, sid):
     """Subagent (child) sessions resolve to the top-level session that owns them."""
     if not db or not sid:
         return sid
+    table = session_table(db)
     for _ in range(20):
-        row = db.execute("select parent_id from session where id = ?", (sid,)).fetchone()
+        row = db.execute(f"select parent_id from {table} where id = ?", (sid,)).fetchone()
         if not row or not row[0]:
             break
         sid = row[0]
@@ -212,7 +219,7 @@ def guess_session(db, cwd, claimed):
     if not db:
         return None
     rows = db.execute(
-        "select id from session where directory = ? and parent_id is null"
+        f"select id from {session_table(db)} where directory = ? and parent_id is null"
         " and time_archived is null order by time_updated desc limit 50", (cwd,))
     return next((r[0] for r in rows if r[0] not in claimed), None)
 
