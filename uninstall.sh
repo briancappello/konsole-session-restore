@@ -35,19 +35,21 @@ if added:
     subprocess.run(["kwriteconfig6", *KSM, ",".join(keep)], check=True)
     print("restored Plasma session-restore exclusions")
 
-if m.get("tui_json_entry"):
-    tui, plugin = m["tui_json_entry"]
+# Lists since the agent status plugin; single keys from older manifests.
+entries = list(m.get("tui_json_entries", [])) + ([m["tui_json_entry"]] if m.get("tui_json_entry") else [])
+plugins = list(m.get("opencode_plugins", [])) + ([m["opencode_plugin"]] if m.get("opencode_plugin") else [])
+for tui, plugin in entries:
     try:
         cfg = json.loads(Path(tui).read_text())
         if plugin in cfg.get("plugin", []):
             cfg["plugin"].remove(plugin)
             Path(tui).write_text(json.dumps(cfg, indent=2) + "\n")
-            print(f"removed plugin entry from {tui}")
+            print(f"removed {plugin} entry from {tui}")
     except (OSError, ValueError):
         print(f"NOTE: remove \"{plugin}\" from {tui} by hand")
-if m.get("opencode_plugin"):
-    Path(m["opencode_plugin"]).unlink(missing_ok=True)
-    print(f"removed {m['opencode_plugin']}")
+for plugin in plugins:
+    Path(plugin).unlink(missing_ok=True)
+    print(f"removed {plugin}")
 PY
 
 systemctl --user daemon-reload

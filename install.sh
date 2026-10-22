@@ -94,29 +94,42 @@ if added:
     print(f"excluded Konsole from Plasma's own session restore ({', '.join(added)})")
 manifest["exclude_apps_added"] = sorted(set(manifest.get("exclude_apps_added", [])) | set(added))
 
-# Optional opencode TUI plugin.
+# Optional opencode TUI plugins: the session tracker (used by restore) and the
+# agent status glyph in the tab title.
 if env["WITH_OPENCODE"] == "yes":
     oc = Path(env["CONFIG"]) / "opencode"
-    plugin = oc / "tui-plugins" / "konsole-session-tracker.ts"
-    plugin.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(Path(env["REPO"]) / "opencode" / "konsole-session-tracker.ts", plugin)
-    manifest["opencode_plugin"] = str(plugin)
     tui = oc / "tui.json"
-    if (oc / "tui.jsonc").exists() and not tui.exists():
-        print(f"NOTE: add \"{plugin}\" to the \"plugin\" list in {oc / 'tui.jsonc'} by hand")
-    else:
+    # Older manifests recorded a single plugin; migrate them to the lists.
+    plugins_installed = manifest.pop("opencode_plugins", None) or []
+    if manifest.get("opencode_plugin"):
+        plugins_installed.append(manifest.pop("opencode_plugin"))
+    entries = manifest.pop("tui_json_entries", None) or []
+    if manifest.get("tui_json_entry"):
+        entries.append(manifest.pop("tui_json_entry"))
+    for name, label in (("konsole-session-tracker.ts", "session tracker"),
+                        ("konsole-agent-status.ts", "agent status")):
+        plugin = oc / "tui-plugins" / name
+        plugin.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(env["REPO"]) / "opencode" / name, plugin)
+        if str(plugin) not in plugins_installed:
+            plugins_installed.append(str(plugin))
+        if (oc / "tui.jsonc").exists() and not tui.exists():
+            print(f"NOTE: add \"{plugin}\" to the \"plugin\" list in {oc / 'tui.jsonc'} by hand")
+            continue
         try:
             cfg = json.loads(tui.read_text()) if tui.exists() else {"$schema": "https://opencode.ai/tui.json"}
         except ValueError:
-            cfg = None
             print(f"NOTE: {tui} is not plain JSON; add \"{plugin}\" to its \"plugin\" list by hand")
-        if cfg is not None:
-            plugins = cfg.setdefault("plugin", [])
-            if str(plugin) not in plugins:
-                plugins.append(str(plugin))
-                tui.write_text(json.dumps(cfg, indent=2) + "\n")
-            manifest["tui_json_entry"] = [str(tui), str(plugin)]
-            print(f"installed opencode session tracker plugin (restart opencode instances to load it)")
+            continue
+        plugins = cfg.setdefault("plugin", [])
+        if str(plugin) not in plugins:
+            plugins.append(str(plugin))
+            tui.write_text(json.dumps(cfg, indent=2) + "\n")
+        if [str(tui), str(plugin)] not in entries:
+            entries.append([str(tui), str(plugin)])
+        print(f"installed opencode {label} plugin (restart opencode instances to load it)")
+    manifest["opencode_plugins"] = plugins_installed
+    manifest["tui_json_entries"] = entries
 
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
