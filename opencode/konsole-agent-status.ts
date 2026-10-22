@@ -86,7 +86,8 @@ const tui = async (api: TuiPluginApi) => {
   // Sessions this TUI has seen run, so idle after work reads as "done".
   const ran = new Set<string>()
 
-  let shown: State = "none"
+  // Undefined forces the first write, which also clears a stale glyph left by a crash.
+  let shown: State | undefined
   let disposed = false
 
   const learnParent = (sessionID: string) => {
