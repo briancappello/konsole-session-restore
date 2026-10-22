@@ -95,17 +95,19 @@ if added:
 manifest["exclude_apps_added"] = sorted(set(manifest.get("exclude_apps_added", [])) | set(added))
 
 # Optional opencode TUI plugins: the session tracker (used by restore) and the
-# agent status glyph in the tab title.
+# agent status glyph in the tab title. opencode 2 loads terminal plugins from
+# the "plugins" list in cli.json (opencode 1 used tui.json; see tag opencode-v1).
 if env["WITH_OPENCODE"] == "yes":
     oc = Path(env["CONFIG"]) / "opencode"
-    tui = oc / "tui.json"
+    cli = oc / "cli.json"
     # Older manifests recorded a single plugin; migrate them to the lists.
     plugins_installed = manifest.pop("opencode_plugins", None) or []
     if manifest.get("opencode_plugin"):
         plugins_installed.append(manifest.pop("opencode_plugin"))
-    entries = manifest.pop("tui_json_entries", None) or []
+    entries = manifest.pop("opencode_config_entries", None) or manifest.pop("tui_json_entries", None) or []
     if manifest.get("tui_json_entry"):
         entries.append(manifest.pop("tui_json_entry"))
+    manifest.pop("tui_json_entries", None)
     for name, label in (("konsole-session-tracker.ts", "session tracker"),
                         ("konsole-agent-status.ts", "agent status")):
         plugin = oc / "tui-plugins" / name
@@ -113,23 +115,20 @@ if env["WITH_OPENCODE"] == "yes":
         shutil.copyfile(Path(env["REPO"]) / "opencode" / name, plugin)
         if str(plugin) not in plugins_installed:
             plugins_installed.append(str(plugin))
-        if (oc / "tui.jsonc").exists() and not tui.exists():
-            print(f"NOTE: add \"{plugin}\" to the \"plugin\" list in {oc / 'tui.jsonc'} by hand")
-            continue
         try:
-            cfg = json.loads(tui.read_text()) if tui.exists() else {"$schema": "https://opencode.ai/tui.json"}
+            cfg = json.loads(cli.read_text()) if cli.exists() else {"$schema": "https://opencode.ai/v2/cli.json"}
         except ValueError:
-            print(f"NOTE: {tui} is not plain JSON; add \"{plugin}\" to its \"plugin\" list by hand")
+            print(f"NOTE: {cli} is not plain JSON; add \"{plugin}\" to its \"plugins\" list by hand")
             continue
-        plugins = cfg.setdefault("plugin", [])
+        plugins = cfg.setdefault("plugins", [])
         if str(plugin) not in plugins:
             plugins.append(str(plugin))
-            tui.write_text(json.dumps(cfg, indent=2) + "\n")
-        if [str(tui), str(plugin)] not in entries:
-            entries.append([str(tui), str(plugin)])
+            cli.write_text(json.dumps(cfg, indent=2) + "\n")
+        if [str(cli), str(plugin)] not in entries:
+            entries.append([str(cli), str(plugin)])
         print(f"installed opencode {label} plugin (restart opencode instances to load it)")
     manifest["opencode_plugins"] = plugins_installed
-    manifest["tui_json_entries"] = entries
+    manifest["opencode_config_entries"] = entries
 
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 PY

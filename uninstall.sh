@@ -35,18 +35,23 @@ if added:
     subprocess.run(["kwriteconfig6", *KSM, ",".join(keep)], check=True)
     print("restored Plasma session-restore exclusions")
 
-# Lists since the agent status plugin; single keys from older manifests.
-entries = list(m.get("tui_json_entries", [])) + ([m["tui_json_entry"]] if m.get("tui_json_entry") else [])
+# Entries are [config file, plugin]: cli.json ("plugins") since opencode 2,
+# tui.json ("plugin") in older manifests, which also used single keys.
+entries = (list(m.get("opencode_config_entries", [])) + list(m.get("tui_json_entries", []))
+           + ([m["tui_json_entry"]] if m.get("tui_json_entry") else []))
 plugins = list(m.get("opencode_plugins", [])) + ([m["opencode_plugin"]] if m.get("opencode_plugin") else [])
-for tui, plugin in entries:
+for conf, plugin in entries:
     try:
-        cfg = json.loads(Path(tui).read_text())
-        if plugin in cfg.get("plugin", []):
-            cfg["plugin"].remove(plugin)
-            Path(tui).write_text(json.dumps(cfg, indent=2) + "\n")
-            print(f"removed {plugin} entry from {tui}")
+        cfg = json.loads(Path(conf).read_text())
+        for key in ("plugins", "plugin"):
+            if plugin in cfg.get(key, []):
+                cfg[key].remove(plugin)
+                Path(conf).write_text(json.dumps(cfg, indent=2) + "\n")
+                print(f"removed {plugin} entry from {conf}")
+    except FileNotFoundError:
+        pass
     except (OSError, ValueError):
-        print(f"NOTE: remove \"{plugin}\" from {tui} by hand")
+        print(f"NOTE: remove \"{plugin}\" from {conf} by hand")
 for plugin in plugins:
     Path(plugin).unlink(missing_ok=True)
     print(f"removed {plugin}")

@@ -6,22 +6,22 @@
  * Consumed by ~/.local/bin/konsole-state to reopen the same session after a
  * reboot, regardless of how the instance was started or which session the
  * user switched to inside the TUI.
+ *
+ * Requires OpenCode 2. The OpenCode 1 version is tagged `opencode-v1`.
  */
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
+import type { Plugin } from "@opencode/plugin/tui"
 
 const POLL_MS = 1000
 
 const stateDir = join(process.env.XDG_STATE_HOME || join(homedir(), ".local/state"), "opencode-tui-sessions")
 const stateFile = join(stateDir, `${process.pid}.json`)
 
-function currentSessionID(api: TuiPluginApi): string | null {
-  const route = api.route.current
-  if (route.name !== "session") return null
-  const id = (route.params as { sessionID?: unknown } | undefined)?.sessionID
-  return typeof id === "string" ? id : null
+function currentSessionID(ctx: Plugin.Context): string | null {
+  const route = ctx.ui.router.current()
+  return route.type === "session" ? route.sessionID : null
 }
 
 function write(sessionID: string | null) {
@@ -34,11 +34,11 @@ function write(sessionID: string | null) {
   renameSync(tmp, stateFile)
 }
 
-const tui = async (api: TuiPluginApi) => {
+function setup(ctx: Plugin.Context) {
   let last: string | null | undefined
   const tick = () => {
     try {
-      const id = currentSessionID(api)
+      const id = currentSessionID(ctx)
       if (id === last) return
       write(id)
       last = id
@@ -48,10 +48,12 @@ const tui = async (api: TuiPluginApi) => {
   }
   tick()
   const timer = setInterval(tick, POLL_MS)
-  api.lifecycle.onDispose(() => {
+  return () => {
     clearInterval(timer)
     rmSync(stateFile, { force: true })
-  })
+  }
 }
 
-export default { id: "konsole-session-tracker", tui }
+// Plain object rather than Plugin.define (an identity function), so the file
+// has no runtime dependency on the plugin package.
+export default { id: "konsole-session-tracker", setup } satisfies Plugin.Definition

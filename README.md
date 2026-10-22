@@ -25,7 +25,7 @@ Every minute, a systemd user timer records a snapshot. When you log in, the tool
 - Python 3.8 or later.
 - The Qt 6 `qdbus` tool. Its package name is different on each distribution.
 - The Python `dbus` module (`python3-dbus` or `python-dbus`). Without it, the tool does not move windows. Konsole windows and tabs are still restored.
-- Optional: opencode, for the opencode session feature.
+- Optional: opencode 2, for the opencode features. For opencode 1, use the tag `opencode-v1`.
 - Optional: `spectacle`, ImageMagick and `kscreen-doctor`, for `--evidence` only.
 
 The tool is tested on Plasma 6.7 with Wayland. X11 sessions are not tested.
@@ -40,21 +40,21 @@ The tool is tested on Plasma 6.7 with Wayland. X11 sessions are not tested.
    ```
 
 3. Read the output of `konsole-state doctor` at the end. Each `FAIL` line tells you what is missing.
-4. If you use opencode, restart each opencode instance. The tracker plugin loads only at start.
+4. If you use opencode, restart each opencode instance. The plugins load only at start.
 
 The installer writes these files:
 
 - `~/.local/bin/konsole-state`
 - `~/.config/systemd/user/konsole-state.service` and `konsole-state.timer`
 - `~/.config/autostart/konsole-state-restore.desktop`
-- `~/.config/opencode/tui-plugins/konsole-session-tracker.ts`, and an entry in `~/.config/opencode/tui.json` (only if opencode is installed)
+- `~/.config/opencode/tui-plugins/konsole-session-tracker.ts` and `konsole-agent-status.ts`, and an entry for each in the `plugins` list of `~/.config/opencode/cli.json` (only if opencode is installed)
 
 The installer also adds Konsole to `excludeApps` in `ksmserverrc`. This is the System Settings field "Applications to be excluded from sessions". Without it, Plasma opens an extra empty Konsole window at login. The installer keeps the applications that you already excluded.
 
 Options:
 
 - `--bin-dir DIR` installs the script into `DIR` instead of `~/.local/bin`.
-- `--no-opencode` skips the opencode plugin.
+- `--no-opencode` skips the opencode plugins.
 
 You can run the installer again. It does not add duplicate entries.
 
@@ -107,7 +107,9 @@ If no rule gives a match, the window stays where it is. The script looks for new
 
 **Self-check.** About 45 seconds after the restore, the script records a new snapshot and compares it with the restored snapshot. The result goes to the journal (see Troubleshooting).
 
-**opencode.** The plugin records the session that each opencode instance shows. It writes the session ID to `~/.local/state/opencode-tui-sessions/<pid>.json`. The save uses this file, so each tab opens the same session again. This works also after you change the session inside opencode.
+**opencode.** The plugin records the session that each opencode instance shows. It writes the session ID to `~/.local/state/opencode-tui-sessions/<pid>.json`. The save uses this file, so each tab opens the same session again. This works also after you change the session inside opencode. If a tab has no record, the save uses the most recent session in the tab's directory.
+
+**opencode tab status.** A second plugin shows the state of each opencode tab as a mark at the start of the tab title: 🟡 the agent works, 🔴 the agent waits for you (a permission or a question, also from a subagent), 🟢 the agent is done. The plugin restores the original tab title when opencode stops.
 
 ## Troubleshooting
 
