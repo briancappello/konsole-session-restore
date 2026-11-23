@@ -2,7 +2,7 @@
 
 Save your Konsole windows and tabs, and the place of all your windows, on KDE Plasma 6. Get them back after you log out or reboot.
 
-Every minute, a systemd user timer records a snapshot. When you log in, the tool opens your Konsole windows and tabs again. Then it puts each window back on its virtual desktop and monitor.
+A snapshot is recorded when you log out, restart or shut down, before any window closes. A systemd user timer also records one every 5 minutes, in case of a crash or power loss. When you log in, the tool opens your Konsole windows and tabs again. Then it puts each window back on its virtual desktop and monitor.
 
 ## What it restores
 
@@ -45,7 +45,7 @@ The tool is tested on Plasma 6.7 with Wayland. X11 sessions are not tested.
 The installer writes these files:
 
 - `~/.local/bin/konsole-state`
-- `~/.config/systemd/user/konsole-state.service` and `konsole-state.timer`
+- `~/.config/systemd/user/konsole-state.service`, `konsole-state.timer` and `konsole-state-watch.service`
 - `~/.config/autostart/konsole-state-restore.desktop`
 - `~/.config/opencode/tui-plugins/konsole-session-tracker/tui.ts` and `konsole-agent-status/tui.ts`, and an entry for each directory in the `plugins` list of `~/.config/opencode/cli.json` (only if opencode is installed). opencode ignores an entry that points to a single file.
 
@@ -69,11 +69,12 @@ The uninstaller reads the manifest that the installer wrote (`~/.local/state/kon
 
 ## Usage
 
-The timer and the login entry do the work. You do not have to run commands. These commands are available:
+The timer, the logout watcher and the login entry do the work. You do not have to run commands. These commands are available:
 
 | Command | Purpose |
 |---|---|
-| `konsole-state save` | Record a snapshot now, for example before a reboot. |
+| `konsole-state save` | Record a snapshot now. |
+| `konsole-state watch` | Record a snapshot when Plasma logs out, restarts or shuts down. The `konsole-state-watch` service runs it. |
 | `konsole-state restore [FILE]` | Open the windows of a snapshot. Add `--run` to run saved commands again. |
 | `konsole-state place FILE --dry-run` | Show how the windows of a snapshot match your open windows. Remove `--dry-run` to move them. |
 | `konsole-state verify EXPECTED ACTUAL` | Compare two snapshots. |
@@ -90,9 +91,15 @@ Snapshots are in `~/.local/state/konsole-state/`:
 
 ## How it works
 
-**Save.** The timer runs `konsole-state save` every 60 seconds. The script reads each Konsole window and tab over D-Bus. It reads the working directory and the command of each tab from `/proc`. It reads the desktop, position and size of every window from KWin over D-Bus. The new snapshot replaces the old one in one atomic step.
+**Save.** The timer runs `konsole-state save` every 5 minutes. The script reads each Konsole window and tab over D-Bus. It reads the working directory and the command of each tab from `/proc`. It reads the desktop, position and size of every window from KWin over D-Bus. The new snapshot replaces the old one in one atomic step.
 
-A save does not run in three cases. Plasma is shutting down, no Konsole window is open, or another save or restore is running. In these cases the previous snapshot stays. The first save after a reboot keeps the old snapshot as `session.last-boot.json`.
+**Save at logout.** The `konsole-state-watch` service registers with the Plasma session manager (ksmserver) as a session client. When you log out, restart or shut down, ksmserver asks each client to save its state and waits for the answers. Plasma closes the windows only after that. The watcher records a snapshot at this moment, so recent changes are not lost.
+
+A shutdown or reboot that does not go through Plasma, for example `systemctl reboot` in a terminal or over SSH, skips this step. For these, the watcher holds a systemd-logind delay lock (`systemd-inhibit --list` shows it). logind waits for the watcher to record a snapshot before it stops the session.
+
+The watcher uses `libSM` (XSMP) directly and does not need Qt. Its log is in `journalctl --user -u konsole-state-watch`.
+
+A save does not run in three cases. Plasma is shutting down (except the save of the logout watcher), no Konsole window is open, or another save or restore is running. In these cases the previous snapshot stays. The first save after a reboot keeps the old snapshot as `session.last-boot.json`.
 
 **Restore.** At login, the autostart entry runs `konsole-state restore --if-none`. If a Konsole window is already open, the script does not open Konsole windows. Each saved window opens as a new Konsole process with all its tabs. The script then selects the saved active tab.
 
@@ -144,7 +151,7 @@ If the panel shows a window from another desktop after login, run `restore` with
 ## Known limits
 
 - The tool uses some Konsole and KWin behavior that is not documented. A Plasma or Konsole update can change it. `konsole-state doctor` and the self-check show such changes in the journal.
-- A snapshot can be up to 60 seconds old. Before a planned reboot, run `konsole-state save`.
+- After a crash, a power loss or a forced shutdown, the snapshot can be up to 5 minutes old.
 - Konsole reports the active tab only for the window that has focus. For this reason, the self-check reports a wrong active tab as a note, not as a failure.
 - The window size at launch uses a title bar of 28 pixels (Breeze at scale 1). Placement corrects a small difference.
 - Firefox can mark restored windows as "demands attention". The Plasma task manager shows such windows on all desktops. After placement, the script removes this mark from windows on other desktops.

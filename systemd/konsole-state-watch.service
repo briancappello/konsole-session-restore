@@ -1,0 +1,14 @@
+[Unit]
+Description=Save Konsole state when Plasma logs out, reboots or shuts down
+Documentation=https://github.com/briancappello/konsole-session-restore
+# ksmserver must be listening before we register with it.
+After=plasma-ksmserver.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=@BIN@ watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

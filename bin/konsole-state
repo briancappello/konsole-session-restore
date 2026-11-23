@@ -12,6 +12,10 @@
                   ImageMagick and kscreen-doctor)
   konsole-state verify EXPECTED.json ACTUAL.json
   konsole-state doctor   # check that this system supports everything used here
+  konsole-state watch [FILE]
+      stay registered with Plasma's session manager and save when it asks:
+      on logout, reboot and shutdown, before Plasma closes any window; also
+      holds a logind delay lock to save before a reboot outside Plasma
   konsole-state place [FILE] [--dry-run]
       move other apps' windows (Firefox, IDEs, ...) back to the virtual desktop,
       monitor/position and maximized state recorded in FILE, matched by app +
@@ -24,7 +28,8 @@ session.last-boot.json (+ .last-boot.screens/) before replacing it.
 
 A save is skipped (previous snapshot kept) while Plasma is shutting down, when
 no Konsole window is open, or while another save/restore holds the lock.
-Automation: konsole-state.timer (systemd --user, every 60 s) saves;
+Automation: konsole-state.timer (systemd --user, every 5 min) saves;
+konsole-state-watch.service runs `watch`, which saves at logout, reboot and shutdown;
 ~/.config/autostart/konsole-state-restore.desktop restores at login.
 
 Saved per tab: profile, working directory, foreground command, visible screen text.
@@ -361,13 +366,15 @@ def archive_previous_boot(file):
           f"{file.stem}.last-boot.json")
 
 
-def save(file, quiet=False):
+def save(file, quiet=False, force=False):
+    """force: save even while Plasma is shutting down (used by watch, which runs
+    before Plasma closes any window) and wait for a running save instead of skipping."""
     # Skip reasons are always logged (journal), even with --quiet.
     # Mid-logout, Plasma is closing windows: a snapshot now would be partial.
-    if plasma_shutting_down():
+    if not force and plasma_shutting_down():
         print("Plasma is shutting down; keeping the previous snapshot")
         return
-    with state_lock(file, blocking=False) as locked:
+    with state_lock(file, blocking=force) as locked:
         if not locked:
             print("Another save/restore is running; skipped")
             return
@@ -459,6 +466,186 @@ def log(msg, quiet=False):
         print(msg)
 
 
+def watch_logind(on_shutdown):
+    """Call on_shutdown before a shutdown or reboot that does not go through Plasma
+    (systemctl reboot, SSH, power button handled by logind).
+
+    Holds a logind delay lock, so logind waits for on_shutdown (up to
+    InhibitDelayMaxSec, 5 s by default) before it stops the session. Runs in a
+    background thread; uses the systemd-inhibit and gdbus tools.
+    """
+    import threading
+
+    missing = [t for t in ("systemd-inhibit", "gdbus") if not shutil.which(t)]
+    if missing:
+        print(f"{', '.join(missing)} not found: shutdowns outside Plasma are not saved")
+        return
+
+    def inhibit():
+        return subprocess.Popen(
+            ["systemd-inhibit", "--what=shutdown", "--mode=delay", "--who=konsole-state",
+             "--why=Saving Konsole windows and tabs", "sleep", "infinity"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def run():
+        lock = inhibit()
+        monitor = subprocess.Popen(
+            ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+             "--object-path", "/org/freedesktop/login1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in monitor.stdout:
+            if ".PrepareForShutdown (true" in line:
+                on_shutdown()
+                if lock:
+                    lock.terminate()  # release: logind continues the shutdown
+                    lock = None
+            elif ".PrepareForShutdown (false" in line and not lock:
+                lock = inhibit()  # shutdown was cancelled
+        print("logind monitor stopped: shutdowns outside Plasma are no longer saved")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def watch(file):
+    """Register with Plasma's session manager (XSMP) and save when it asks.
+
+    On logout, reboot and shutdown, ksmserver sends SaveYourself to every XSMP
+    client and waits for the replies (up to clientShutdownTimeoutSecs, 15 s by
+    default) before Plasma closes any Wayland window, so every Konsole window
+    is still open here. XSMP runs over ICE, not X11 or Wayland: libSM through
+    ctypes is enough, no Qt needed.
+    """
+    import ctypes
+    import ctypes.util
+    import getpass
+    import select
+    from ctypes import CFUNCTYPE, POINTER, Structure, byref, c_char_p, c_int, c_ulong, c_void_p
+
+    if not os.environ.get("SESSION_MANAGER"):
+        print("SESSION_MANAGER is not set: not inside a Plasma session")
+        return 1
+    try:
+        sm = ctypes.CDLL(ctypes.util.find_library("SM") or "libSM.so.6")
+        ice = ctypes.CDLL(ctypes.util.find_library("ICE") or "libICE.so.6")
+    except OSError as e:
+        print(f"libSM/libICE not found: {e}")
+        return 1
+
+    save_yourself_proc = CFUNCTYPE(None, c_void_p, c_void_p, c_int, c_int, c_int, c_int)
+    simple_proc = CFUNCTYPE(None, c_void_p, c_void_p)
+
+    class Callbacks(Structure):  # SmcCallbacks: four {callback, client_data} pairs
+        _fields_ = [("save_yourself", save_yourself_proc), ("save_yourself_data", c_void_p),
+                    ("die", simple_proc), ("die_data", c_void_p),
+                    ("save_complete", simple_proc), ("save_complete_data", c_void_p),
+                    ("shutdown_cancelled", simple_proc), ("shutdown_cancelled_data", c_void_p)]
+
+    class PropValue(Structure):
+        _fields_ = [("length", c_int), ("value", c_char_p)]
+
+    class Prop(Structure):
+        _fields_ = [("name", c_char_p), ("type", c_char_p), ("num_vals", c_int),
+                    ("vals", POINTER(PropValue))]
+
+    sm.SmcOpenConnection.restype = c_void_p
+    sm.SmcOpenConnection.argtypes = [c_char_p, c_void_p, c_int, c_int, c_ulong, POINTER(Callbacks),
+                                     c_char_p, POINTER(c_char_p), c_int, c_char_p]
+    sm.SmcSaveYourselfDone.argtypes = [c_void_p, c_int]
+    sm.SmcSetProperties.argtypes = [c_void_p, c_int, POINTER(POINTER(Prop))]
+    sm.SmcCloseConnection.argtypes = [c_void_p, c_int, c_void_p]
+    sm.SmcGetIceConnection.restype = c_void_p
+    sm.SmcGetIceConnection.argtypes = [c_void_p]
+    ice.IceConnectionNumber.argtypes = [c_void_p]
+    ice.IceProcessMessages.argtypes = [c_void_p, c_void_p, c_void_p]
+
+    done = False
+    logout_saved = False
+
+    def on_save_yourself(conn, _data, save_type, shutdown, interact_style, fast):
+        nonlocal logout_saved
+        start = time.monotonic()
+        kind = {0: "global", 1: "local", 2: "both"}.get(save_type, save_type)
+        print(f"SaveYourself: type={kind} shutdown={bool(shutdown)} fast={bool(fast)} "
+              f"plasma isShuttingDown={plasma_shutting_down()}")
+        try:
+            save(file, force=True)
+            logout_saved = logout_saved or bool(shutdown)
+        except Exception as e:  # noqa: BLE001 - always answer, or logout waits for the timeout
+            print(f"save failed: {e}")
+        sm.SmcSaveYourselfDone(conn, 1)
+        print(f"SaveYourselfDone after {time.monotonic() - start:.2f}s")
+
+    def on_prepare_for_shutdown():
+        # A Plasma restart also ends here, after Plasma closed every window:
+        # keep the snapshot taken at SaveYourself.
+        if logout_saved or plasma_shutting_down():
+            print("PrepareForShutdown: Plasma logout already handled; keeping its snapshot")
+            return
+        start = time.monotonic()
+        print("PrepareForShutdown: shutdown or reboot outside Plasma")
+        try:
+            save(file, force=True)
+        except Exception as e:  # noqa: BLE001 - always release the lock
+            print(f"save failed: {e}")
+        print(f"PrepareForShutdown save done after {time.monotonic() - start:.2f}s")
+
+    def on_die(conn, _data):
+        nonlocal done
+        print("Die: session is ending")
+        done = True
+
+    def on_save_complete(_conn, _data):
+        print("SaveComplete")
+
+    def on_shutdown_cancelled(_conn, _data):
+        nonlocal logout_saved
+        logout_saved = False
+        print("ShutdownCancelled: logout was cancelled")
+
+    # Keep references: ctypes callbacks must outlive the connection.
+    callbacks = Callbacks(save_yourself_proc(on_save_yourself), None, simple_proc(on_die), None,
+                          simple_proc(on_save_complete), None,
+                          simple_proc(on_shutdown_cancelled), None)
+    client_id = c_char_p()
+    error = ctypes.create_string_buffer(256)
+    conn = sm.SmcOpenConnection(None, None, 1, 0, 0b1111, byref(callbacks), None,
+                                byref(client_id), len(error), error)
+    if not conn:
+        print(f"cannot connect to the session manager: {error.value.decode(errors='replace')}")
+        return 1
+
+    # Required XSMP properties. RestartNever: ksmserver must not relaunch this
+    # at login (systemd/autostart starts it); it still gets SaveYourself and Die.
+    me = sys.argv[0]
+    values = []
+
+    def prop(name, typ, *vals):
+        arr = (PropValue * len(vals))(*[PropValue(len(v), v) for v in vals])
+        values.append(arr)
+        return Prop(name.encode(), typ.encode(), len(vals), arr)
+
+    props = [prop("Program", "ARRAY8", me.encode()),
+             prop("UserID", "ARRAY8", getpass.getuser().encode()),
+             prop("RestartCommand", "LISTofARRAY8", me.encode(), b"watch"),
+             prop("CloneCommand", "LISTofARRAY8", me.encode(), b"watch"),
+             prop("ProcessID", "ARRAY8", str(os.getpid()).encode()),
+             prop("RestartStyleHint", "CARD8", bytes([3]))]  # SmRestartNever
+    ptrs = (POINTER(Prop) * len(props))(*[ctypes.pointer(p) for p in props])
+    sm.SmcSetProperties(conn, len(props), ptrs)
+    print(f"Registered with the session manager as {client_id.value.decode()}")
+    watch_logind(on_prepare_for_shutdown)
+
+    ice_conn = sm.SmcGetIceConnection(conn)
+    fd = ice.IceConnectionNumber(ice_conn)
+    while not done:
+        select.select([fd], [], [])
+        if ice.IceProcessMessages(ice_conn, None, None) != 0:  # IceProcessMessagesSuccess
+            print("Session manager connection closed")
+            return 0
+    sm.SmcCloseConnection(conn, 0, None)
+    return 0
+
+
 def wait_for_service(name, timeout=30.0):
     # Generous: at login many windows start at once, each with opencode + MCP servers.
     end = time.time() + timeout
@@ -471,6 +658,10 @@ def wait_for_service(name, timeout=30.0):
                 pass
         time.sleep(0.2)
     raise RuntimeError(f"Konsole service {name} did not appear")
+
+
+RECLAIM_TTY = ("import os, signal; signal.signal(signal.SIGTTOU, signal.SIG_IGN); "
+               "os.tcsetpgrp(0, os.getpgrp())")
 
 
 def tab_launcher(path, tab, run):
@@ -494,6 +685,10 @@ def tab_launcher(path, tab, run):
         if run or tab.get("autorun"):
             # Interactive shell so rc-file PATH/aliases are available to the command.
             lines.append(f'"${{SHELL:-/bin/sh}}" -ic {shlex.quote(cmd)}')
+            # The -i shell's job control moves the command into its own foreground
+            # process group and nothing hands the terminal back when it exits, so the
+            # final shell below would get EIO reading the tty and close the tab.
+            lines.append(f"{shlex.quote(sys.executable)} -c {shlex.quote(RECLAIM_TTY)} 2>/dev/null")
         else:
             lines.append(f"printf '\\n[konsole-state] previous command: %s\\n' {shlex.quote(cmd)}")
     lines.append('exec "${SHELL:-/bin/sh}"')
@@ -1021,7 +1216,7 @@ def reassert_current_tabs(targets):
 def main(argv):
     # Line-buffered so journal output survives if the unit is killed mid-run.
     sys.stdout.reconfigure(line_buffering=True)
-    if len(argv) < 2 or argv[1] not in ("save", "restore", "verify", "place", "doctor"):
+    if len(argv) < 2 or argv[1] not in ("save", "restore", "verify", "place", "doctor", "watch"):
         print(__doc__)
         return 2
     if argv[1] == "doctor":
@@ -1034,6 +1229,8 @@ def main(argv):
         return verify(*rest)
     # Absolute: tab launchers run from each tab's own workdir.
     file = (Path(rest[0]).expanduser() if rest else DEFAULT_FILE).resolve()
+    if argv[1] == "watch":
+        return watch(file)
     if argv[1] == "save":
         save(file, quiet="--quiet" in argv)
     elif argv[1] == "place":
@@ -1109,6 +1306,13 @@ def doctor():
           hint="Plasma must be started with systemd (the default) for the save timer")
     check("FAIL", "save timer active",
           run("systemctl", "--user", "is-active", "konsole-state.timer") == "active")
+    check("WARN", "logout watcher active",
+          run("systemctl", "--user", "is-active", "konsole-state-watch.service") == "active",
+          hint="changes since the last timer save are lost at logout; journalctl --user -u konsole-state-watch")
+    inhibitors = run("systemd-inhibit", "--list", "--no-legend", "--no-pager")
+    check("WARN", "logind delay lock held (reboot outside Plasma)",
+          any("konsole-state" in l and "delay" in l for l in inhibitors.splitlines()),
+          hint="systemctl reboot from a terminal is not saved; needs systemd-inhibit and gdbus")
     autostart = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart/konsole-state-restore.desktop"
     check("FAIL", "login restore autostart entry", autostart.exists(), hint=f"missing {autostart}")
     exclude = run("kreadconfig6", "--file", "ksmserverrc", "--group", "General", "--key", "excludeApps")
@@ -1118,7 +1322,7 @@ def doctor():
     try:
         snap = json.loads(DEFAULT_FILE.read_text())
         age = time.time() - snap["saved_at"]
-        check("WARN", "recent snapshot", age < 180, f"{age:.0f}s old, {len(snap['windows'])} window(s)",
+        check("WARN", "recent snapshot", age < 420, f"{age:.0f}s old, {len(snap['windows'])} window(s)",
               hint="saves are skipped while no Konsole window is open")
     except (OSError, ValueError, KeyError):
         check("WARN", "recent snapshot", False, hint=f"none at {DEFAULT_FILE} yet")

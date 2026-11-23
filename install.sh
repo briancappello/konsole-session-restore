@@ -60,9 +60,10 @@ mkdir -p "$BIN_DIR" "$UNIT_DIR" "$AUTOSTART_DIR" "$STATE"
 install -m 755 "${REPO}/bin/konsole-state" "$BIN"
 sed "s|@BIN@|${BIN}|g" "${REPO}/systemd/konsole-state.service" > "${UNIT_DIR}/konsole-state.service"
 install -m 644 "${REPO}/systemd/konsole-state.timer" "${UNIT_DIR}/konsole-state.timer"
+sed "s|@BIN@|${BIN}|g" "${REPO}/systemd/konsole-state-watch.service" > "${UNIT_DIR}/konsole-state-watch.service"
 sed "s|@BIN@|${BIN}|g" "${REPO}/autostart/konsole-state-restore.desktop" \
     > "${AUTOSTART_DIR}/konsole-state-restore.desktop"
-say "installed ${BIN}, systemd timer and login autostart entry"
+say "installed ${BIN}, systemd timer, logout watcher and login autostart entry"
 
 # --- Settings merges (recorded in the manifest) -----------------------------------
 WITH_OPENCODE="$WITH_OPENCODE" CONFIG="$CONFIG" REPO="$REPO" BIN="$BIN" MANIFEST="$MANIFEST" \
@@ -79,6 +80,7 @@ except (OSError, ValueError):
 manifest.update({
     "bin": env["BIN"],
     "files": [env["BIN"], f"{env['UNIT_DIR']}/konsole-state.service", f"{env['UNIT_DIR']}/konsole-state.timer",
+              f"{env['UNIT_DIR']}/konsole-state-watch.service",
               f"{env['AUTOSTART_DIR']}/konsole-state-restore.desktop"],
 })
 
@@ -145,13 +147,18 @@ PY
 
 # --- Activate ---------------------------------------------------------------------
 systemctl --user daemon-reload
-systemctl --user enable --now konsole-state.timer >/dev/null 2>&1
-say "save timer enabled (every 60 s)"
+systemctl --user enable konsole-state.timer >/dev/null 2>&1
+systemctl --user restart konsole-state.timer >/dev/null 2>&1  # pick up a changed interval
+say "save timer enabled (every 5 minutes)"
+systemctl --user enable konsole-state-watch.service >/dev/null 2>&1
+systemctl --user restart konsole-state-watch.service >/dev/null 2>&1 \
+    || warn "logout watcher did not start; see: journalctl --user -u konsole-state-watch"
+say "logout watcher enabled (saves when Plasma logs out, reboots or shuts down)"
 "$BIN" save --quiet || true
 
 say ""
 say "Checking the system:"
 "$BIN" doctor || warn "doctor reported problems (see FAIL lines above)"
 say ""
-say "Done. Windows are saved every minute and restored at the next login."
+say "Done. Windows are saved at logout and every 5 minutes, and restored at the next login."
 say "Uninstall with: ${REPO}/uninstall.sh [--purge]"

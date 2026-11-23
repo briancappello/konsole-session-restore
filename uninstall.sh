@@ -17,6 +17,7 @@ MANIFEST="${STATE}/install-manifest.json"
 [[ -f "$MANIFEST" ]] || { echo "error: no install manifest at ${MANIFEST}; nothing to undo" >&2; exit 1; }
 
 systemctl --user disable --now konsole-state.timer >/dev/null 2>&1 || true
+systemctl --user disable --now konsole-state-watch.service >/dev/null 2>&1 || true
 
 MANIFEST="$MANIFEST" python3 - <<'PY'
 import json, os, re, shutil, subprocess
